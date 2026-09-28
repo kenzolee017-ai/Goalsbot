@@ -8,31 +8,49 @@ Button-driven bot with two trackers:
   BUILDING FUND
     - one-time setup: "what sacrifice will you make every day?"
     - "Upload Log" asks: today's sacrifice, how much saved, optional photo
+      (skip with a button, no need to type "skip")
     - tracks a running total, celebrated with a rotating congrats message
     - "See what others logged" shows a shared feed (name, CG, date, photo,
       sacrifice, and that entry's amount - never anyone's running total)
+    - "Update Sacrifice" lets you change your standing daily commitment
+    - own logs can be deleted individually from "See All Logs"
 
   GOALS TRACKER
     - loop to add one or more goals (goal, target date/duration, daily plan)
     - "another goal?" + an Edit button on every goal-added confirmation
-    - daily log entries, optional photo, milestone broadcasts, etc.
+    - daily log entries, optional photo (skip with a button), milestone
+      broadcasts, etc.
 
-Onboarding: tap "Start" -> name -> CG -> main menu (Building Fund / Goals
-Tracker). Every day at a set time (default 10pm) the bot pings "Update your
-logs!" with buttons for both trackers.
+Every logging action returns you to that tracker's menu afterward. Onboarding:
+tap "Start" -> name -> CG -> main menu (Building Fund / Goals Tracker). Every
+day at a set time (default 10pm) the bot sends one combined check-in: your
+active goals, days left on each, your Building Fund total to date, and a
+prompt for what you did today.
+
+Optionally syncs every event live to a Google Sheet (two tabs: Building Fund,
+Goals). Two ways to connect it (use ONE):
+  A) Apps Script webhook (no Google Cloud needed): set GOOGLE_SCRIPT_URL and
+     GOOGLE_SCRIPT_SECRET.
+  B) Service account: set GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON.
+Sync failures never block the bot itself.
 
 Setup:
-  pip install "python-telegram-bot[job-queue]>=21.0"
+  pip install "python-telegram-bot[job-queue]>=21.0" gspread google-auth
   export BOT_TOKEN="123456:ABC-your-token-from-@BotFather"
   python goals_bot.py
 
 Optional env vars:
-  BOT_TIMEZONE   IANA timezone name (default: Asia/Singapore)
-  BOT_DATA_FILE  path to the JSON data file (default: goals_data.json)
+  BOT_TIMEZONE                IANA timezone name (default: Asia/Singapore)
+  BOT_DATA_FILE                path to the JSON data file (default: goals_data.json)
+  GOOGLE_SCRIPT_URL             Apps Script web app URL (option A)
+  GOOGLE_SCRIPT_SECRET          shared password matching the script (option A)
+  GOOGLE_SHEET_ID               the spreadsheet ID from its URL (option B)
+  GOOGLE_SERVICE_ACCOUNT_JSON   full contents of a service-account JSON key (option B)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -66,6 +84,10 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TIMEZONE = ZoneInfo(os.environ.get("BOT_TIMEZONE", "Asia/Singapore"))
 DATA_FILE = Path(os.environ.get("BOT_DATA_FILE", "goals_data.json"))
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL", "").strip()
+GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET", "").strip()
 
 DEFAULT_HOUR = 22          # 10pm
 DEFAULT_MINUTE = 0
@@ -112,6 +134,168 @@ NOT_ONBOARDED_MSG = "Let's finish setting you up first - send /start 🙂"
 
 
 # --------------------------------------------------------------------------
+# Google Sheets sync (optional - only runs if both env vars are set).
+# Every write is best-effort: any failure is logged and swallowed so a
+# Sheets problem can never break the bot itself. Calls are made through
+# asyncio.to_thread from the async handlers since gspread is blocking I/O.
+# --------------------------------------------------------------------------
+
+BF_SHEET_TAB = "Building Fund"
+BF_SHEET_HEADERS = [
+    "Timestamp", "Name", "CG", "Chat ID", "Event",
+    "Standing Sacrifice", "Today's Sacrifice", "Amount ($)",
+    "Total To Date ($)", "Has Photo",
+]
+
+GOALS_SHEET_TAB = "Goals"
+GOALS_SHEET_HEADERS = [
+    "Timestamp", "Name", "CG", "Chat ID", "Event Type",
+    "Goal ID", "Goal Text", "Timeline", "Target Date", "Daily Action Plan",
+    "Status", "Day Number", "Log Text", "Has Photo",
+]
+
+_sheet_cache = None  # cached gspread Spreadsheet object, or False if unavailable
+
+
+def _get_sheet():
+    """Returns the gspread Spreadsheet, or None if sync isn't configured/failed."""
+    global _sheet_cache
+    if _sheet_cache is False:
+        return None
+    if _sheet_cache is not None:
+        return _sheet_cache
+    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        _sheet_cache = False
+        return None
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        client = gspread.authorize(creds)
+        _sheet_cache = client.open_by_key(GOOGLE_SHEET_ID)
+        log.info("Google Sheets sync enabled.")
+        return _sheet_cache
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Google Sheets sync unavailable: %s", exc)
+        _sheet_cache = False
+        return None
+
+
+def _get_or_create_tab(sheet, title: str, headers: List[str]):
+    import gspread
+    try:
+        ws = sheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=title, rows=2000, cols=len(headers))
+        ws.append_row(headers)
+        try:
+            ws.freeze(rows=1)
+            ws.format("1:1", {"textFormat": {"bold": True}})
+        except Exception as exc:  # noqa: BLE001 - cosmetic only
+            log.warning("Could not format header row: %s", exc)
+        return ws
+    if not ws.row_values(1):
+        ws.append_row(headers)
+    return ws
+
+
+def _safe_cell(value: Any) -> Any:
+    """Stops user-typed text from being run as a spreadsheet formula."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
+def _sync_enabled() -> bool:
+    return bool(GOOGLE_SCRIPT_URL) or _get_sheet() is not None
+
+
+def _post_to_script(tab: str, headers: List[str], row: List[Any]) -> None:
+    """Sends one row to the user's Apps Script web app (blocking; run in a thread)."""
+    import urllib.request
+
+    payload = json.dumps({
+        "secret": GOOGLE_SCRIPT_SECRET, "tab": tab, "headers": headers, "row": row,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        GOOGLE_SCRIPT_URL, data=payload, headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:  # follows Google's redirect
+        body = resp.read().decode("utf-8", "replace")
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"unexpected reply from script: {body[:120]!r}")
+    if not result.get("ok"):
+        raise RuntimeError(f"script refused the row: {result.get('error')}")
+
+
+def _append_row(tab: str, headers: List[str], row: List[Any]) -> None:
+    row = [_safe_cell(v) for v in row]
+    if GOOGLE_SCRIPT_URL:
+        _post_to_script(tab, headers, row)
+        return
+    sheet = _get_sheet()
+    if sheet is None:
+        return
+    ws = _get_or_create_tab(sheet, tab, headers)
+    ws.append_row(row)
+
+
+def sync_bf_row(chat_id: int, chat: Dict[str, Any], entry: Dict[str, Any],
+                event: str = "Logged") -> None:
+    """Appends one row to the Building Fund tab. Safe to call even if sync is off.
+
+    event="Deleted" records a removal as a negative amount so the sheet's
+    running totals stay reconcilable with the bot.
+    """
+    if not _sync_enabled():
+        return
+    try:
+        total = bf_total_saved(chat)
+        amount = entry.get("amount", 0) or 0
+        if event == "Deleted":
+            amount = -amount
+        _append_row(BF_SHEET_TAB, BF_SHEET_HEADERS, [
+            datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+            chat.get("name", ""), chat.get("cg", ""), str(chat_id), event,
+            chat.get("bf_sacrifice", ""), entry.get("sacrifice_today", ""),
+            amount, total,
+            "Yes" if entry.get("photo_file_id") else "No",
+        ])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Sheet sync (Building Fund) failed: %s", exc)
+
+
+def sync_goal_row(chat_id: int, chat: Dict[str, Any], event_type: str,
+                   goal: Optional[Dict[str, Any]] = None,
+                   day_number_val: Optional[int] = None,
+                   log_text: str = "", has_photo: bool = False) -> None:
+    """Appends one row to the Goals tab. Safe to call even if sync is off."""
+    if not _sync_enabled():
+        return
+    try:
+        goal = goal or {}
+        _append_row(GOALS_SHEET_TAB, GOALS_SHEET_HEADERS, [
+            datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+            chat.get("name", ""), chat.get("cg", ""), str(chat_id),
+            event_type,
+            goal.get("id", ""), goal.get("text", ""), goal.get("timeline", ""),
+            goal.get("target_date", ""), goal.get("daily_action", ""),
+            goal.get("status", ""),
+            day_number_val or "", log_text,
+            "Yes" if has_photo else "No",
+        ])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Sheet sync (Goals) failed: %s", exc)
+
+
+# --------------------------------------------------------------------------
 # Storage  (simple JSON file, one record per chat)
 # --------------------------------------------------------------------------
 
@@ -140,6 +324,15 @@ def save_data(data: Dict[str, Any]) -> None:
             os.unlink(tmp_path)
 
 
+def _backfill_bf_entry_ids(chat: Dict[str, Any]) -> None:
+    next_id = chat.get("next_bf_entry_id", 1)
+    for e in chat.get("bf_entries", []):
+        if "id" not in e:
+            e["id"] = next_id
+            next_id += 1
+    chat["next_bf_entry_id"] = next_id
+
+
 def get_chat(data: Dict[str, Any], chat_id: int) -> Dict[str, Any]:
     """Fetch (or create) a chat record, backfilling any missing fields."""
     chat = data.setdefault(str(chat_id), {})
@@ -161,6 +354,8 @@ def get_chat(data: Dict[str, Any], chat_id: int) -> Dict[str, Any]:
     chat.setdefault("bf_setup", False)
     chat.setdefault("bf_entries", [])
     chat.setdefault("pending_bf_entry", {})
+    chat.setdefault("next_bf_entry_id", 1)
+    _backfill_bf_entry_ids(chat)
     # shared
     chat.setdefault("hour", DEFAULT_HOUR)
     chat.setdefault("minute", DEFAULT_MINUTE)
@@ -245,6 +440,41 @@ def active_goals(chat: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def bf_total_saved(chat: Dict[str, Any]) -> float:
     return sum((e.get("amount") or 0) for e in chat.get("bf_entries", []))
+
+
+def finalize_bf_entry(chat: Dict[str, Any], data: Dict[str, Any], photo_file_id: Optional[str]) -> str:
+    """Appends the pending Building Fund entry, saves, and returns the congrats message."""
+    entry = chat.get("pending_bf_entry", {})
+    entry["date"] = today().isoformat()
+    entry["photo_file_id"] = photo_file_id
+    entry["id"] = chat.get("next_bf_entry_id", 1)
+    chat["next_bf_entry_id"] = entry["id"] + 1
+    chat.setdefault("bf_entries", []).append(entry)
+    chat["pending_bf_entry"] = {}
+    chat["stage"] = READY
+    save_data(data)
+    total = bf_total_saved(chat)
+    return BF_LOG_MESSAGES[(len(chat["bf_entries"]) - 1) % len(BF_LOG_MESSAGES)].format(total=total)
+
+
+def finalize_goal_photo(chat: Dict[str, Any], data: Dict[str, Any], photo_file_id: Optional[str]):
+    """Attaches (or skips) a photo on the pending goals-tracker log entry.
+
+    Returns (message, entry) - entry is the completed log entry dict, or None
+    if the pending index was somehow lost.
+    """
+    idx = chat.get("pending_entry_index")
+    entry = None
+    if idx is not None and 0 <= idx < len(chat.get("entries", [])):
+        entry = chat["entries"][idx]
+        if photo_file_id:
+            entry["photo_file_id"] = photo_file_id
+    day = entry["day"] if entry else day_number(chat)
+    chat["stage"] = READY
+    chat["pending_entry_index"] = None
+    save_data(data)
+    msg = f"📸 Photo added to Day {day}! Nice work today 💪" if photo_file_id else "No worries, logged without a photo 📝👍"
+    return msg, entry
 
 
 def signature(chat: Dict[str, Any]) -> str:
@@ -437,6 +667,7 @@ async def action_show_bf_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) 
          InlineKeyboardButton("💰 Check Amount Saved", callback_data="bf_check_saved")],
         [InlineKeyboardButton("📖 See All Logs", callback_data="bf_see_logs"),
          InlineKeyboardButton("👀 See What Others Logged", callback_data="bf_see_others")],
+        [InlineKeyboardButton("✏️ Update Sacrifice", callback_data="bf_update_sacrifice")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
     ]
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -484,11 +715,31 @@ async def action_bf_see_logs(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
         await context.bot.send_message(chat_id=chat_id, text="Nothing logged yet in the Building Fund 📖 - tap Upload Log to start!")
         return
     has_photos = any(e.get("photo_file_id") for e in chat.get("bf_entries", []))
+    rows = []
     if has_photos:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📸 See photo log", callback_data="bf_show_photos")]])
-        await context.bot.send_message(chat_id=chat_id, text=f"📖 Your Building Fund log:\n\n{history}", reply_markup=keyboard)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=f"📖 Your Building Fund log:\n\n{history}")
+        rows.append([InlineKeyboardButton("📸 See photo log", callback_data="bf_show_photos")])
+    if chat.get("bf_entries"):
+        rows.append([InlineKeyboardButton("🗑️ Delete a Log", callback_data="bf_delete_menu")])
+    markup = InlineKeyboardMarkup(rows) if rows else None
+    await context.bot.send_message(chat_id=chat_id, text=f"📖 Your Building Fund log:\n\n{history}", reply_markup=markup)
+
+
+async def action_bf_delete_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_data()
+    chat = get_chat(data, chat_id)
+    entries = chat.get("bf_entries", [])[-10:]
+    if not entries:
+        await context.bot.send_message(chat_id=chat_id, text="Nothing to delete.")
+        return
+    keyboard = [
+        [InlineKeyboardButton(f"🗑️ {e['date']} — ${e.get('amount', 0):.2f}", callback_data=f"bfdel_{e['id']}")]
+        for e in reversed(entries)
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Which log would you like to delete? 🗑️ (most recent 10 shown)",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def action_bf_see_others(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -697,15 +948,18 @@ async def daily_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = data.get(str(chat_id))
     if not chat or not chat.get("onboarded") or not chat.get("reminders_on", True):
         return
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🏗️ Building Fund", callback_data="reminder_bf"),
-        InlineKeyboardButton("🎯 Goals Tracker", callback_data="reminder_goals"),
-    ]])
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🔔 Update your logs!\n\nWhat would you like to work on today?",
-        reply_markup=keyboard,
+
+    total = bf_total_saved(chat)
+    text = (
+        "🔔 Daily Check-in!\n\n"
+        f"🎯 Your goals:\n{format_goals_checkin(chat)}\n\n"
+        f"💰 Building Fund saved so far: ${total:.2f}\n\n"
+        "What have you done today to keep track of your goals? 📝"
     )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏗️ Log Building Fund Today", callback_data="reminder_bf")]])
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+    chat["stage"] = GOALS_AWAITING_DAILY_LOG
+    save_data(data)
 
 
 # --------------------------------------------------------------------------
@@ -848,6 +1102,67 @@ async def callback_bf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await action_bf_see_logs(chat_id, context)
     elif d == "bf_see_others":
         await action_bf_see_others(chat_id, context)
+    elif d == "bf_update_sacrifice":
+        data = load_data()
+        chat = get_chat(data, chat_id)
+        chat["stage"] = BF_AWAITING_SACRIFICE_SETUP
+        save_data(data)
+        await context.bot.send_message(chat_id=chat_id, text="💪 What's your new daily sacrifice?")
+    elif d == "bf_delete_menu":
+        await action_bf_delete_menu(chat_id, context)
+
+
+async def callback_bf_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    entry_id = int(query.data.split("_", 1)[1])
+
+    data = load_data()
+    chat = get_chat(data, chat_id)
+    removed = next((e for e in chat.get("bf_entries", []) if e.get("id") == entry_id), None)
+    chat["bf_entries"] = [e for e in chat.get("bf_entries", []) if e.get("id") != entry_id]
+    save_data(data)
+
+    if removed:
+        total = bf_total_saved(chat)
+        await query.edit_message_text(f"🗑️ Deleted. New total saved: ${total:.2f}")
+        await asyncio.to_thread(sync_bf_row, chat_id, chat, removed, "Deleted")
+    else:
+        await query.edit_message_text("Couldn't find that log - it may already be gone.")
+    await action_show_bf_menu(chat_id, context)
+
+
+async def callback_skip_goal_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    data = load_data()
+    chat = get_chat(data, chat_id)
+    if chat["stage"] != AWAITING_PHOTO:
+        return
+    msg, entry = finalize_goal_photo(chat, data, None)
+    await query.edit_message_text(msg)
+    if entry:
+        await asyncio.to_thread(
+            sync_goal_row, chat_id, chat, "Daily Log",
+            day_number_val=entry["day"], log_text=entry["text"], has_photo=False,
+        )
+    await action_show_goals_menu(chat_id, context)
+
+
+async def callback_skip_bf_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    data = load_data()
+    chat = get_chat(data, chat_id)
+    if chat["stage"] != BF_AWAITING_PHOTO:
+        return
+    msg = finalize_bf_entry(chat, data, None)
+    await query.edit_message_text(msg)
+    await asyncio.to_thread(sync_bf_row, chat_id, chat, chat["bf_entries"][-1])
+    await action_show_bf_menu(chat_id, context)
 
 
 async def callback_bf_show_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -901,10 +1216,7 @@ async def callback_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    if query.data == "reminder_bf":
-        await action_reminder_bf(chat_id, context)
-    else:
-        await action_goals_log_prompt(chat_id, context)
+    await action_reminder_bf(chat_id, context)
 
 
 async def callback_editgoal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,6 +1279,7 @@ async def callback_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"🎉🏆 Just completed a goal:\n\"{goal['text']}\"! 👏👏\n\n— {signature(chat)}",
         exclude_chat_id=chat_id,
     )
+    await asyncio.to_thread(sync_goal_row, chat_id, chat, "Goal Completed", goal=goal)
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Yes 🙌", callback_data=f"gainyes_{goal_id}"),
@@ -1107,8 +1420,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             [InlineKeyboardButton("✏️ Edit this goal", callback_data=f"editgoal_{goal['id']}")],
         ]
         await update.message.reply_text(confirm, reply_markup=InlineKeyboardMarkup(keyboard))
+        await asyncio.to_thread(sync_goal_row, chat_id, chat, "Goal Set", goal=goal)
         return
-
     # ---- editing an existing goal's field ------------------------------------
     if stage == AWAITING_EDIT_VALUE:
         pe = chat.get("pending_edit", {})
@@ -1146,8 +1459,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         confirm += f"\n🔁 {goal['daily_action']}"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit again", callback_data=f"editgoal_{goal['id']}")]])
         await update.message.reply_text(confirm, reply_markup=keyboard)
+        await asyncio.to_thread(sync_goal_row, chat_id, chat, "Goal Edited", goal=goal)
         return
-
     # ---- milestone broadcast ----------------------------------------------
     if stage == AWAITING_MILESTONE:
         msg = f"🌟 MILESTONES 🌟\n\n{text}\n\n— {signature(chat)}"
@@ -1155,6 +1468,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chat["stage"] = READY
         save_data(data)
         await update.message.reply_text("Shared with everyone! 🌟🙌")
+        await asyncio.to_thread(sync_goal_row, chat_id, chat, "Milestone", log_text=text)
         return
 
     # ---- "what did you gain" broadcast -------------------------------------
@@ -1168,14 +1482,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chat["pending_finish_goal_id"] = None
         save_data(data)
         await update.message.reply_text("Shared with everyone! 🎉🙌")
+        await asyncio.to_thread(sync_goal_row, chat_id, chat, "Gained Share", goal=goal, log_text=text)
         return
 
     # ---- expecting a goals-tracker photo, got text instead -> skip -------------
     if stage == AWAITING_PHOTO:
-        chat["stage"] = READY
-        chat["pending_entry_index"] = None
-        save_data(data)
-        await update.message.reply_text("No worries, logged without a photo 📝👍")
+        msg, entry = finalize_goal_photo(chat, data, None)
+        await update.message.reply_text(msg)
+        if entry:
+            await asyncio.to_thread(
+                sync_goal_row, chat_id, chat, "Daily Log",
+                day_number_val=entry["day"], log_text=entry["text"], has_photo=False,
+            )
+        await action_show_goals_menu(chat_id, context)
         return
 
     # ---- goals tracker: today's log entry (explicit, via button/reminder) -----
@@ -1188,7 +1507,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         save_data(data)
         await update.message.reply_text(
             f"✅ Logged for Day {day}:\n\"{text}\"\n\n"
-            "📸 Want to add a photo to today's log? Send one now, or type 'skip'."
+            "📸 Want to add a photo to today's log? Send one now, or tap Skip.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Skip", callback_data="skip_goal_photo")]]),
         )
         return
 
@@ -1221,21 +1541,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chat["pending_bf_entry"]["amount"] = amount
         chat["stage"] = BF_AWAITING_PHOTO
         save_data(data)
-        await update.message.reply_text("📸 Got a photo of today's sacrifice? Send it now, or type 'skip'.")
+        await update.message.reply_text(
+            "📸 Got a photo of today's sacrifice? Send it now, or tap Skip.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Skip", callback_data="skip_bf_photo")]]),
+        )
         return
 
     # ---- building fund: expecting a photo, got text -> finalize without one ---
     if stage == BF_AWAITING_PHOTO:
-        entry = chat.get("pending_bf_entry", {})
-        entry["date"] = today().isoformat()
-        entry["photo_file_id"] = None
-        chat.setdefault("bf_entries", []).append(entry)
-        chat["pending_bf_entry"] = {}
-        chat["stage"] = READY
-        save_data(data)
-        total = bf_total_saved(chat)
-        msg = BF_LOG_MESSAGES[(len(chat["bf_entries"]) - 1) % len(BF_LOG_MESSAGES)].format(total=total)
+        msg = finalize_bf_entry(chat, data, None)
         await update.message.reply_text(msg)
+        await asyncio.to_thread(sync_bf_row, chat_id, chat, chat["bf_entries"][-1])
+        await action_show_bf_menu(chat_id, context)
         return
 
     # ---- default: idle + unexpected text -> nudge toward the menu -------------
@@ -1250,29 +1567,23 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stage = chat["stage"]
 
     if stage == AWAITING_PHOTO and chat.get("pending_entry_index") is not None:
-        idx = chat["pending_entry_index"]
         file_id = update.message.photo[-1].file_id
-        day = day_number(chat)
-        if 0 <= idx < len(chat["entries"]):
-            chat["entries"][idx]["photo_file_id"] = file_id
-            day = chat["entries"][idx]["day"]
-        chat["stage"] = READY
-        chat["pending_entry_index"] = None
-        save_data(data)
-        await update.message.reply_text(f"📸 Photo added to Day {day}! Nice work today 💪")
+        msg, entry = finalize_goal_photo(chat, data, file_id)
+        await update.message.reply_text(msg)
+        if entry:
+            await asyncio.to_thread(
+                sync_goal_row, chat_id, chat, "Daily Log",
+                day_number_val=entry["day"], log_text=entry["text"], has_photo=True,
+            )
+        await action_show_goals_menu(chat_id, context)
         return
 
     if stage == BF_AWAITING_PHOTO:
-        entry = chat.get("pending_bf_entry", {})
-        entry["date"] = today().isoformat()
-        entry["photo_file_id"] = update.message.photo[-1].file_id
-        chat.setdefault("bf_entries", []).append(entry)
-        chat["pending_bf_entry"] = {}
-        chat["stage"] = READY
-        save_data(data)
-        total = bf_total_saved(chat)
-        msg = BF_LOG_MESSAGES[(len(chat["bf_entries"]) - 1) % len(BF_LOG_MESSAGES)].format(total=total)
+        file_id = update.message.photo[-1].file_id
+        msg = finalize_bf_entry(chat, data, file_id)
         await update.message.reply_text(msg)
+        await asyncio.to_thread(sync_bf_row, chat_id, chat, chat["bf_entries"][-1])
+        await action_show_bf_menu(chat_id, context)
         return
 
     await update.message.reply_text(
@@ -1330,13 +1641,19 @@ def main() -> None:
 
     app.add_handler(CallbackQueryHandler(callback_do_start, pattern=r"^do_start$"))
     app.add_handler(CallbackQueryHandler(callback_menu, pattern=r"^menu_(main|bf|goals)$"))
-    app.add_handler(CallbackQueryHandler(callback_bf, pattern=r"^bf_(upload|check_saved|see_logs|see_others)$"))
+    app.add_handler(CallbackQueryHandler(
+        callback_bf,
+        pattern=r"^bf_(upload|check_saved|see_logs|see_others|update_sacrifice|delete_menu)$",
+    ))
+    app.add_handler(CallbackQueryHandler(callback_bf_delete, pattern=r"^bfdel_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_bf_show_photos, pattern=r"^bf_show_photos$"))
+    app.add_handler(CallbackQueryHandler(callback_skip_goal_photo, pattern=r"^skip_goal_photo$"))
+    app.add_handler(CallbackQueryHandler(callback_skip_bf_photo, pattern=r"^skip_bf_photo$"))
     app.add_handler(CallbackQueryHandler(
         callback_goals,
         pattern=r"^goals_(log_today|add|finish|view|log_view|photos|milestone|addanother|done)$",
     ))
-    app.add_handler(CallbackQueryHandler(callback_reminder, pattern=r"^reminder_(bf|goals)$"))
+    app.add_handler(CallbackQueryHandler(callback_reminder, pattern=r"^reminder_bf$"))
     app.add_handler(CallbackQueryHandler(callback_editgoal, pattern=r"^editgoal_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_editfield, pattern=r"^editfield_(text|timeline|daily)_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_finish, pattern=r"^finish_\d+$"))
