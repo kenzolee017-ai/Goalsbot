@@ -84,6 +84,32 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TIMEZONE = ZoneInfo(os.environ.get("BOT_TIMEZONE", "Asia/Singapore"))
 DATA_FILE = Path(os.environ.get("BOT_DATA_FILE", "goals_data.json"))
+_LEGACY_DATA_FILE = Path("goals_data.json")  # the bot's old default location
+
+
+def _migrate_legacy_data_file() -> None:
+    """If BOT_DATA_FILE now points somewhere new (e.g. onto a freshly-attached
+    Volume) and that path is empty, but data still exists at the bot's old
+    default location, copy it over. Without this, switching to a Volume would
+    look like everyone's logs got wiped, when really the bot just started
+    reading from an empty new spot."""
+    try:
+        if DATA_FILE.exists():
+            return  # already has data at the configured location - nothing to do
+        if DATA_FILE.resolve() == _LEGACY_DATA_FILE.resolve():
+            return  # same path, no migration needed
+        if _LEGACY_DATA_FILE.exists():
+            import shutil
+            DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_LEGACY_DATA_FILE, DATA_FILE)
+            logging.getLogger("goals-bot").info(
+                "Migrated existing data from %s to %s", _LEGACY_DATA_FILE, DATA_FILE
+            )
+    except OSError as exc:
+        logging.getLogger("goals-bot").warning("Could not migrate legacy data file: %s", exc)
+
+
+_migrate_legacy_data_file()
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL", "").strip()
